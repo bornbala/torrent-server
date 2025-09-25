@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: torrent-stream-server
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: node index.js
+    autoDeploy: true
+    pullRequestPreviewsEnabled: false
+    envVars:
+      - key: PORT
+        value: "4000"
+    disk:
+      name: torrent-temp
+      path: /tmp
+      sizeGB: 1
