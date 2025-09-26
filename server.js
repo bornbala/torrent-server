@@ -2,25 +2,36 @@ const express = require('express');
 const torrentStream = require('torrent-stream');
 const pump = require('pump');
 const rangeParser = require('range-parser');
+const mime = require('mime');
+const ffmpeg = require('fluent-ffmpeg');
+const { PassThrough } = require('stream');
 
 const app = express();
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 
-// Helper: start torrent engine
+// cache engines per magnet
+const engines = new Map();
+
 function getEngine(magnet) {
+  if (engines.has(magnet)) return engines.get(magnet);
+
   const engine = torrentStream(magnet, {
-    tmp: './tmp',  // folder to store partial pieces
+    tmp: './tmp',
+    path: './downloads',
   });
 
   engine.on('ready', () => {
     console.log('Torrent ready. Files:');
-    engine.files.forEach(f => console.log(`- ${f.name} (${f.length} bytes)`));
+    engine.files.forEach(f =>
+      console.log(`- ${f.path} (${(f.length / 1024 / 1024).toFixed(2)} MB)`)
+    );
   });
 
+  engines.set(magnet, engine);
   return engine;
 }
 
-// Streaming endpoint
+// Streaming with transcoding
 app.get('/stream', (req, res) => {
   const magnet = req.query.magnet;
   if (!magnet) return res.status(400).send('Missing magnet param');
@@ -28,31 +39,48 @@ app.get('/stream', (req, res) => {
   const engine = getEngine(magnet);
 
   engine.on('ready', () => {
-    // Choose largest file (usually the movie/video)
+    // Pick largest file
     const file = engine.files.reduce((a, b) => (a.length > b.length ? a : b));
-    const total = file.length;
-    const range = req.headers.range;
 
-    if (range) {
-      const ranges = rangeParser(total, range)[0];
-      const { start, end } = ranges;
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${total}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': (end - start) + 1,
-        'Content-Type': 'video/mp4',
-      });
-      pump(file.createReadStream({ start, end }), res);
-    } else {
-      res.writeHead(200, {
-        'Content-Length': total,
-        'Content-Type': 'video/mp4',
-      });
-      pump(file.createReadStream(), res);
-    }
+    console.log(`🎬 Streaming file: ${file.name}`);
+
+    // create torrent read stream
+    const torrentStreamFile = file.createReadStream();
+
+    // prepare ffmpeg passthrough
+    const passthrough = new PassThrough();
+
+    ffmpeg(torrentStreamFile)
+      .videoCodec('libx264') // universal H.264
+      .audioCodec('aac')     // AAC audio
+      .format('mp4')         // output format
+      .outputOptions([
+        '-preset veryfast',  // speed vs quality tradeoff
+        '-movflags frag_keyframe+empty_moov', // enables fragmented MP4 for streaming
+        '-pix_fmt yuv420p',
+        '-crf 23'
+      ])
+      .on('start', cmd => console.log('FFmpeg started:', cmd))
+      .on('error', err => {
+        console.error('FFmpeg error:', err);
+        res.status(500).end('FFmpeg failed');
+      })
+      .pipe(passthrough);
+
+    res.writeHead(200, {
+      'Content-Type': 'video/mp4',
+      'Transfer-Encoding': 'chunked',
+    });
+
+    pump(passthrough, res);
+  });
+
+  engine.on('error', (err) => {
+    console.error('Torrent engine error:', err);
+    res.status(500).send('Torrent engine error');
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Server running at http://localhost:${PORT}`);
+  console.log(`✅ Transcoding server running at http://localhost:${PORT}`);
 });
